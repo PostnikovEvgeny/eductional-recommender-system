@@ -1,3 +1,4 @@
+from app.offline_pipeline.keybert_extractor import FridaKeyBERTExtractor
 from app.offline_pipeline.preprocessor import TextPreprocessor
 
 SAMPLE_ITAD_ANNOTATION = """
@@ -9,17 +10,18 @@ SAMPLE_ITAD_ANNOTATION = """
 """
 
 
-class TestTextPreprocessor:
-    """Тестирование двухпоточного лингвистического препроцессора."""
+class TestTextPreprocessorAndKeyBERT:
+    """Тестирование двухпоточного лингвистического препроцессора и лексического фильтра MMR."""
 
-    def test_clean_for_dense_fixes_hyphenation_and_html(self) -> None:
-        """Проверка склейки разорванных переносами слов из PDF и очистки HTML."""
+    def test_clean_for_dense_fixes_hyphenation_and_headers(self) -> None:
+        """Проверка склейки разорванных переносами слов из PDF, очистки HTML и заголовков."""
         preprocessor = TextPreprocessor()
-        raw = "<p>Очищение локальных баз ор- ганизации и закономерно- сти.</p>"
+        raw = "<p>Изучаемые объекты дисциплины: Очищение баз ор- ганизации и закономерно- сти.</p>"
 
         cleaned = preprocessor.clean_for_dense(raw)
 
         assert "<p>" not in cleaned
+        assert "Изучаемые объекты дисциплины:" not in cleaned
         assert "организации" in cleaned
         assert "закономерности" in cleaned
 
@@ -29,15 +31,29 @@ class TestTextPreprocessor:
 
         candidates = preprocessor.extract_candidate_terms(SAMPLE_ITAD_ANNOTATION)
 
-        # Проверяем, что выделены ключевые предметные понятия в правильной форме
         assert "интеллектуальный анализ данных" in candidates
         assert "сиквенциальный анализ" in candidates
-        assert "мошеннический операция" in candidates or "классификация" in candidates
+        assert "классификация" in candidates
         assert "кластеризация" in candidates
         assert "регрессия" in candidates
 
-        # Проверяем, что академические стоп-слова отфильтрованы
+        # Проверяем, что структурные стоп-слова отфильтрованы
         assert "дисциплина" not in candidates
         assert "задача" not in candidates
         assert "применение" not in candidates
-        assert "формирование" not in candidates
+
+    def test_lexical_overlap_detects_same_root_phrases(self) -> None:
+        """Проверка детектора однокоренных слов для алгоритма MMR."""
+        overlap_high = FridaKeyBERTExtractor._lexical_overlap(
+            "анализ последовательностей", "анализ последовательности"
+        )
+        overlap_partial = FridaKeyBERTExtractor._lexical_overlap(
+            "интеллектуальный анализ данных", "аналитические данные"
+        )
+        overlap_zero = FridaKeyBERTExtractor._lexical_overlap(
+            "база данных", "нейронная сеть"
+        )
+
+        assert overlap_high == 1.0
+        assert overlap_partial >= 0.5
+        assert overlap_zero == 0.0

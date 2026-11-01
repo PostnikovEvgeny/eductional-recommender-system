@@ -1,6 +1,7 @@
 import logging
 
 from app.offline_pipeline.embedder import FridaEmbedder
+from app.offline_pipeline.keybert_extractor import FridaKeyBERTExtractor
 from app.offline_pipeline.preprocessor import TextPreprocessor
 
 logging.basicConfig(
@@ -8,7 +9,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 
-# Полный текст из файла "Аннотация дисциплины.pdf" (Интеллектуальные технологии анализа данных)
 SAMPLE_ANNOTATION = """
 Технологии интеллектуального анализа данных обеспечивают формирование аналитических данных
 посредством выполнения операции очищения данных локальных баз ор- ганизации, применения
@@ -26,33 +26,36 @@ web-сайтов, анализ последовательности перехо
 
 
 def main() -> None:
-    print("=== 1. Проверка двухпоточного препроцессора на полном тексте аннотации ===")
     preprocessor = TextPreprocessor()
-    dense_text = preprocessor.clean_for_dense(SAMPLE_ANNOTATION)
-    candidates = preprocessor.extract_candidate_terms(SAMPLE_ANNOTATION)
-
-    print(f"Извлеченные термины-кандидаты ({len(candidates)} уникальных):")
-    for term, freq in candidates.most_common(12):
-        print(f"  - {term} (частота: {freq})")
-
-    print("\n=== 2. Загрузка локальной модели FRIDA и расчет векторов ===")
     embedder = FridaEmbedder()
-    disc_vec = embedder.encode_documents([dense_text])[0]
-    print(f"Вектор дисциплины успешно рассчитан: shape={disc_vec.shape}")
+    extractor = FridaKeyBERTExtractor(preprocessor=preprocessor, embedder=embedder)
 
-    test_domains = [
-        "Машинное обучение и интеллектуальный анализ данных",
-        "Проектирование и администрирование баз данных",
-        "Веб-разработка и интернет-приложения",
-        "Строительство уникальных зданий и сооружений",
-        "Бурение нефтяных и газовых скважин",
-    ]
-    domain_vecs = embedder.encode_queries(test_domains)
+    print("=== 1. Извлечение ключевых терминов методом KeyBERT на базе FRIDA (без MMR) ===")
+    all_ranked = extractor.extract_keywords_from_text(
+        SAMPLE_ANNOTATION,
+        top_n=50,
+        min_semantic_score=0.0,
+        use_mmr=False,
+    )
 
-    print("\n=== 3. Проверка косинусного сходства (mu) с асимметричными префиксами ===")
-    for name, d_vec in zip(test_domains, domain_vecs, strict=True):
-        mu = embedder.cosine_similarity(disc_vec, d_vec)
-        print(f"  Интерес '{name:<52}' -> mu = {mu:.4f}")
+    print("\nТОП-10 САМЫХ ВАЖНЫХ ТЕРМИНОВ (по мнению нейросети FRIDA):")
+    for kw in all_ranked[:10]:
+        print(f"  [+] {kw.term:<38} | близость к тексту: {kw.semantic_score:.4f} | частота: {kw.frequency}")
+
+    print("\nАНТИ-ТОП (СЛОВЕСНЫЙ ШУМ, который нейросеть автоматически отбросила вниз):")
+    for kw in all_ranked[-7:]:
+        print(f"  [-] {kw.term:<38} | близость к тексту: {kw.semantic_score:.4f} | частота: {kw.frequency}")
+
+    print("\n=== 2. Финальный отбор ТОП-8 терминов с диверсификацией MMR (KeyBERT + MMR) ===")
+    mmr_keywords = extractor.extract_keywords_from_text(
+        SAMPLE_ANNOTATION,
+        top_n=8,
+        min_semantic_score=0.25,
+        use_mmr=True,
+        diversity=0.35,
+    )
+    for idx, kw in enumerate(mmr_keywords, start=1):
+        print(f"  {idx}. {kw.term:<38} (score: {kw.semantic_score:.4f})")
 
 
 if __name__ == "__main__":
