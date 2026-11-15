@@ -1,3 +1,5 @@
+backend/data/pdfs/
+
 .env
 .env.local
 .env.*.local

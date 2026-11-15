@@ -34,16 +34,21 @@ class FridaKeyBERTExtractor:
     @staticmethod
     def _lexical_overlap(term_a: str, term_b: str) -> float:
         """
-        Вычисляет степень совпадения корней слов между двумя фразами (от 0.0 до 1.0),
-        чтобы MMR не пропускал однокоренные дубликаты ('аналитические данные' и 'анализ данных').
+        Вычисляет степень совпадения значимых корней слов между двумя фразами (от 0.0 до 1.0).
+        Игнорирует общие слова-связки ('разработка', 'система', 'приложение', 'анализ', 'данные'),
+        чтобы 'веб-разработка' и 'мобильная разработка' не считались дубликатами.
         """
-        # Берем первые 5 букв каждого слова как приближение морфологического корня
-        roots_a = {w[:5] for w in term_a.lower().split() if len(w) >= 3}
-        roots_b = {w[:5] for w in term_b.lower().split() if len(w) >= 3}
-        if not roots_a or not roots_b:
+        generic_connectors = {"разра", "прило", "систе", "данны", "техно", "метод", "инфор"}
+        words_a = [w[:5] for w in term_a.lower().replace("-", " ").split() if len(w) >= 3]
+        words_b = [w[:5] for w in term_b.lower().replace("-", " ").split() if len(w) >= 3]
+
+        specific_a = {r for r in words_a if r not in generic_connectors} or set(words_a)
+        specific_b = {r for r in words_b if r not in generic_connectors} or set(words_b)
+
+        if not specific_a or not specific_b:
             return 0.0
-        intersection = len(roots_a & roots_b)
-        min_len = min(len(roots_a), len(roots_b))
+        intersection = len(specific_a & specific_b)
+        min_len = min(len(specific_a), len(specific_b))
         return intersection / min_len
 
     def extract_keywords_from_text(
