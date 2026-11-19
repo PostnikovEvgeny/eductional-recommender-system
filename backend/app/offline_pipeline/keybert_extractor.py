@@ -9,18 +9,20 @@ from app.offline_pipeline.preprocessor import TextPreprocessor
 
 @dataclass(frozen=True)
 class ExtractedKeyword:
-    """Извлеченный ключевой термин с комбинированной оценкой значимости."""
+    """Извлеченный ключевой термин с комбинированной оценкой значимости и привязкой к источнику."""
 
     term: str
     semantic_score: float
     frequency: int
     embedding: np.ndarray
+    source_discipline: str = ""
+    is_anchor: bool = False
 
 
 class FridaKeyBERTExtractor:
     """
     Автоматический экстрактор ключевых терминов по методу KeyBERT + MMR
-    на базе локальной модели FRIDA.
+    на базе локальной модели FRIDA с поддержкой глобального кэша эмбеддингов.
     """
 
     def __init__(
@@ -35,12 +37,16 @@ class FridaKeyBERTExtractor:
     def _lexical_overlap(term_a: str, term_b: str) -> float:
         """
         Вычисляет степень совпадения значимых корней слов между двумя фразами (от 0.0 до 1.0).
-        Игнорирует общие слова-связки ('разработка', 'система', 'приложение', 'анализ', 'данные'),
-        чтобы 'веб-разработка' и 'мобильная разработка' не считались дубликатами.
         """
-        generic_connectors = {"разра", "прило", "систе", "данны", "техно", "метод", "инфор"}
-        words_a = [w[:5] for w in term_a.lower().replace("-", " ").split() if len(w) >= 3]
-        words_b = [w[:5] for w in term_b.lower().replace("-", " ").split() if len(w) >= 3]
+        generic_connectors = {
+            "разра", "прило", "систе", "данны", "техно", "метод", "инфор", "проек", "модел"
+        }
+        words_a = [
+            w[:5] for w in term_a.lower().replace("-", " ").split() if len(w) >= 3
+        ]
+        words_b = [
+            w[:5] for w in term_b.lower().replace("-", " ").split() if len(w) >= 3
+        ]
 
         specific_a = {r for r in words_a if r not in generic_connectors} or set(words_a)
         specific_b = {r for r in words_b if r not in generic_connectors} or set(words_b)
@@ -55,39 +61,78 @@ class FridaKeyBERTExtractor:
         self,
         raw_text: str,
         *,
-        top_n: int = 10,
+        discipline_title: str | None = None,
+        excluded_terms: set[str] | None = None,
+        precomputed_doc_vec: np.ndarray | None = None,
+        candidate_vec_cache: dict[str, np.ndarray] | None = None,
+        top_n: int = 5,
         min_semantic_score: float = 0.35,
         use_mmr: bool = True,
-        diversity: float = 0.40,
+        diversity: float = 0.42,
     ) -> list[ExtractedKeyword]:
         """
-        Извлекает наиболее релевантные смыслу текста термины (KeyBERT + TF + MMR).
+        Извлекает наиболее релевантные смыслу дисциплины термины (KeyBERT + TF + MMR).
+        Помечает термины из названия дисциплины флагом is_anchor=True.
         """
         dense_text = self.preprocessor.clean_for_dense(raw_text)
         if not dense_text:
             return []
 
         candidate_counts = self.preprocessor.extract_candidate_terms(raw_text)
+
+        title_boost_terms: set[str] = set()
+        if discipline_title:
+            title_terms = self.preprocessor.extract_candidate_terms(discipline_title)
+            for t_term, t_freq in title_terms.items():
+                candidate_counts[t_term] += t_freq * 3
+                title_boost_terms.add(t_term)
+
+        if excluded_terms:
+            lowered_excluded = {e.lower().strip() for e in excluded_terms}
+            for term in list(candidate_counts.keys()):
+                if term.lower() in lowered_excluded:
+                    del candidate_counts[term]
+
         if not candidate_counts:
             return []
 
         candidate_terms = list(candidate_counts.keys())
 
-        # 1. Векторизуем текст дисциплины и кандидатов в едином тематическом режиме FRIDA
-        doc_vec = self.embedder.encode_texts([dense_text], prefix="categorize_topic: ")[0]
-        cand_vecs = self.embedder.encode_texts(candidate_terms, prefix="categorize_topic: ")
+        # 1. Используем предвычисленный вектор дисциплины (если передан), иначе считаем
+        if precomputed_doc_vec is not None:
+            doc_vec = precomputed_doc_vec
+        else:
+            doc_vec = self.embedder.encode_long_document(
+                dense_text, prefix="categorize_topic: "
+            )
 
-        # 2. Базовая косинусная близость к тексту + бонус за частоту повторения в тексте
+        # 2. Берем векторы кандидатов из глобального батч-кэша (если передан)
+        if candidate_vec_cache is not None:
+            missing_terms = [t for t in candidate_terms if t not in candidate_vec_cache]
+            if missing_terms:
+                new_vecs = self.embedder.encode_texts(
+                    missing_terms, prefix="categorize_topic: "
+                )
+                for t, v in zip(missing_terms, new_vecs, strict=True):
+                    candidate_vec_cache[t] = v
+            cand_vecs = np.array(
+                [candidate_vec_cache[t] for t in candidate_terms], dtype=np.float32
+            )
+        else:
+            cand_vecs = self.embedder.encode_texts(
+                candidate_terms, prefix="categorize_topic: "
+            )
+
+        # 3. Косинусная близость + бонус за частоту и присутствие в заголовке дисциплины
         raw_cosines = np.dot(cand_vecs, doc_vec)
         weighted_scores: list[float] = []
         for idx, term in enumerate(candidate_terms):
             cos_val = max(0.0, float(raw_cosines[idx]))
             freq = candidate_counts[term]
-            # Небольшой бонус за частоту встречаемости термина в документе
-            tf_boost = 1.0 + 0.12 * math.log(freq) if freq > 1 else 1.0
-            weighted_scores.append(min(1.0, cos_val * tf_boost))
+            tf_boost = 1.0 + 0.10 * math.log(freq) if freq > 1 else 1.0
+            title_multiplier = 1.08 if term in title_boost_terms else 1.0
+            weighted_scores.append(min(1.0, cos_val * tf_boost * title_multiplier))
 
-        # 3. Отбрасываем явный шум ниже порога
         valid_indices = [
             idx
             for idx, score in enumerate(weighted_scores)
@@ -95,6 +140,8 @@ class FridaKeyBERTExtractor:
         ]
         if not valid_indices:
             valid_indices = list(range(len(candidate_terms)))
+
+        source_name = discipline_title or ""
 
         if not use_mmr or len(valid_indices) <= top_n:
             sorted_idx = sorted(
@@ -106,11 +153,12 @@ class FridaKeyBERTExtractor:
                     semantic_score=round(weighted_scores[idx], 4),
                     frequency=candidate_counts[candidate_terms[idx]],
                     embedding=cand_vecs[idx],
+                    source_discipline=source_name,
+                    is_anchor=(candidate_terms[idx] in title_boost_terms),
                 )
                 for idx in sorted_idx
             ]
 
-        # 4. Алгоритм MMR (Maximal Marginal Relevance) с защитой от однокоренных повторов
         selected_indices: list[int] = []
         remaining_indices = list(valid_indices)
 
@@ -126,7 +174,6 @@ class FridaKeyBERTExtractor:
 
             for idx in remaining_indices:
                 relevance = weighted_scores[idx]
-                # Считаем штраф за дублирование как максимум из векторной близости и совпадения корней слов
                 redundancy = max(
                     max(
                         float(np.dot(cand_vecs[idx], cand_vecs[sel_idx])),
@@ -156,6 +203,8 @@ class FridaKeyBERTExtractor:
                 semantic_score=round(weighted_scores[idx], 4),
                 frequency=candidate_counts[candidate_terms[idx]],
                 embedding=cand_vecs[idx],
+                source_discipline=source_name,
+                is_anchor=(candidate_terms[idx] in title_boost_terms),
             )
             for idx in selected_indices
         ]
